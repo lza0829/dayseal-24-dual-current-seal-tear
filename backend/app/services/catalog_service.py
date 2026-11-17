@@ -7,8 +7,6 @@ from app.repositories import settings as settings_repo
 from app.repositories import tills as till_repo
 from app.services.close_service import read_policy
 from app import reseal_policy
-from app import current_batch
-from app import align_24 as align_mod
 
 
 def dashboard() -> dict[str, Any]:

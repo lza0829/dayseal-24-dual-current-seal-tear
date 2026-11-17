@@ -7,7 +7,6 @@ from app.db import connect
 from app.repositories import closes as close_repo
 from app.repositories import lines as line_repo
 from app.repositories import settings as settings_repo
-from app import current_batch
 from app import align_24 as align_mod
 
 _ZERO = 1e-9
@@ -156,7 +155,6 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
                 superseded_batch_ids.append(old["id"])
 
         close_repo.mark_sealed(conn, batch_id)
-        current_batch.keep_old_variance(conn, 0)
         conn.commit()
         return {
             "batch_id": batch_id,
@@ -344,16 +342,6 @@ def integrity() -> dict[str, Any]:
         }
     finally:
         conn.close()
-
-def list_batches_extended() -> list[dict]:
-    rows = list_batches()
-    summary = align_mod.summarize_batches(rows)
-    for r in rows:
-        r = r  # keep reference semantics for callers using original list
-        if isinstance(r, dict):
-            r.setdefault("alignment", summary.get("alignment_token") if False else summary.get("sealed_count"))
-    return rows
-
 
 def preview_reconcile(system_total: float, declared: float) -> dict:
     return align_mod.reconcile_hint(system_total, declared)

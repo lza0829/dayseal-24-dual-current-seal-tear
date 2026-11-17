@@ -47,7 +47,10 @@ async function seal() {
 }
 
 function batchState(b) {
-  if (b.status === 'sealed') return { text: '现行已封', cls: 'ok' }
+  // 现行标记以后端收敛口径为准：同日多行 sealed 残留时只有一行是现行。
+  const isCurrent = b.is_current ?? (b.status === 'sealed')
+  if (isCurrent) return { text: '现行已封', cls: 'ok' }
+  if (b.status === 'sealed') return { text: '已封残留（非现行）', cls: 'bad' }
   if (b.status === 'superseded') return { text: '已被覆盖（只读）', cls: 'bad' }
   return { text: b.status, cls: 'warn' }
 }

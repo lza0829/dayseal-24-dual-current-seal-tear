@@ -543,3 +543,168 @@ def test_legacy_duplicate_sealed_is_collapsed_on_migrate(tmp_path, monkeypatch):
     # 数字未被改写
     assert superseded[0]["system_total"] == 1.0
     assert superseded[0]["declared_cash"] == 1.0
+
+
+# ------------------------------------------------------------------ 现行钉扎唯一性互证
+# 「双 sealed」「superseded 仍拒写」「长短款挂旧批」三条路径交叉验证：
+# 同时至多一个 sealed 现行；总览已封、写闸、长短款现行必须同源。
+
+def _inject_second_sealed(day=SEED_DAY, batch_no="CB-9001", declared=500.0):
+    """模拟并发双封 / 旧 bug 残留：同日第二行 sealed（绕过唯一索引直写）。"""
+    from app.db import connect
+
+    conn = connect(immediate=True)
+    try:
+        conn.execute("DROP INDEX IF EXISTS ux_close_batches_current_day")
+        variance = round(declared - SEED_TOTAL, 2)
+        conn.execute(
+            '''INSERT INTO close_batches(batch_no, business_day, system_total, declared_cash,
+               variance, line_count, status, sealed_at)
+               VALUES (?, ?, ?, ?, ?, 5, 'sealed', '2026-11-16T23:59:59Z')''',
+            (batch_no, day, SEED_TOTAL, declared, variance),
+        )
+        bid = conn.execute(
+            "SELECT id FROM close_batches WHERE batch_no=?", (batch_no,)
+        ).fetchone()["id"]
+        conn.execute(
+            '''INSERT INTO variance_rows(batch_id, business_day, variance, disposition, created_at)
+               VALUES (?,?,?,?,?)''',
+            (bid, day, variance, "pending", "2026-11-16T23:59:59Z"),
+        )
+        conn.commit()
+        return bid
+    finally:
+        conn.close()
+
+
+def test_double_sealed_residue_converges_to_single_current(client):
+    """双 sealed 残留：所有读路径收敛到「最近成功封账批」这一个现行。"""
+    first = _seal(client, 480.0).json()  # 长短款 -9.4，pending
+    residue_id = _inject_second_sealed()  # id 更大 = 更晚封账 = 收敛后的现行
+
+    # 批次现行标记：current_only 恰好一行，且是最近封账批
+    current = _batches(client, current_only=True)
+    assert [b["batch_no"] for b in current] == ["CB-9001"]
+    allb = _batches(client)
+    assert [b["batch_no"] for b in allb if b["is_current"]] == ["CB-9001"]
+
+    # 总览已封计数与现行读数同源：计数为 1，数字全部来自最近封账批
+    dash = client.get("/api/dashboard").json()
+    assert dash["sealed_today"] is True
+    assert dash["current_batch_no"] == "CB-9001"
+    assert dash["current_close_batch_count"] == 1
+    assert dash["current_system_total"] == SEED_TOTAL
+    assert dash["current_declared_cash"] == 500.0
+    assert dash["current_variance"] == 10.6
+    # 未处置长短款只数现行批（残留批的 pending 不重复计数）
+    assert dash["open_variance_count"] == 1
+
+    # 长短款现行只挂最近封账批；残留批的差额行不再冒充现行
+    cur_var = _variances(client, current_only=True)
+    assert [v["batch_no"] for v in cur_var] == ["CB-9001"]
+    flags = {v["batch_no"]: v["is_current"] for v in _variances(client)}
+    assert flags == {"CB-9001": True, "CB-0001": False}
+
+    # 扩展总览与主总览同源，不把残留双计
+    ext = client.get("/api/dashboard/extended").json()
+    assert ext["close_batch_count"] == dash["close_batch_count"]
+    assert ext["sealed_days"] == [SEED_DAY]
+
+    # 写闸 / 日锁同源：现行批存在即锁
+    assert _line(client, SEED_DAY).status_code == 409
+    assert client.get("/api/close/current").json()["batch_no"] == "CB-9001"
+
+    # 自检仍能发现残留（检测与读路径收敛是两回事）
+    integ = client.get("/api/close/integrity").json()
+    assert integ["ok"] is False
+    assert any(v["code"] == "multiple_current_batches" for v in integ["violations"])
+
+    # 重封（supersede）把残留收口到唯一现行：两行旧 sealed 一起降级
+    assert _set_policy(client, "supersede").status_code == 200
+    reseal = _seal(client, SEED_TOTAL)
+    assert reseal.status_code == 200, reseal.text
+    assert set(reseal.json()["superseded_batch_ids"]) == {first["batch_id"], residue_id}
+    assert [b["batch_no"] for b in _batches(client, current_only=True)] == [
+        reseal.json()["batch_no"]
+    ]
+    assert client.get("/api/close/integrity").json()["ok"] is True
+
+
+def test_superseded_batch_drives_no_lock_and_no_sealed_count(client):
+    """superseded 旧批：不构成日锁、不计入已封、永不带现行标记。"""
+    _seal(client, SEED_TOTAL)  # 现行批在 2026-11-16
+    # 构造「只剩 superseded 批」的营业日（取代链断裂的极端残留）
+    from app.db import connect
+
+    conn = connect(immediate=True)
+    try:
+        conn.execute(
+            '''INSERT INTO close_batches(batch_no, business_day, system_total, declared_cash,
+               variance, line_count, status, sealed_at, superseded_by_batch_id)
+               VALUES ('CB-8001', '2026-11-14', 10.0, 10.0, 0.0, 1, 'superseded',
+                       '2026-11-14T10:00:00Z', NULL)'''
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 写闸：superseded 不构成锁 → 该日可写；现行 sealed 日仍锁
+    assert _line(client, "2026-11-14").status_code == 200
+    assert _line(client, SEED_DAY).status_code == 409
+
+    # 模块级同源判定：日锁与现行列表都只认 sealed 现行
+    from app import current_batch
+
+    conn = connect()
+    try:
+        assert current_batch.is_day_sealed(conn, "2026-11-14") is False
+        assert current_batch.is_day_sealed(conn, SEED_DAY) is True
+        current = current_batch.list_current(conn)
+        assert [b["business_day"] for b in current] == [SEED_DAY]
+        assert all(b["status"] == "sealed" for b in current)
+    finally:
+        conn.close()
+
+    # 已封计数：superseded 不计入现行；扩展总览与主总览同源
+    dash = client.get("/api/dashboard").json()
+    assert dash["current_close_batch_count"] == 1
+    assert dash["superseded_batch_count"] == 1
+    ext = client.get("/api/dashboard/extended").json()
+    assert ext["sealed_days"] == [SEED_DAY]
+    assert ext["close_batch_count"] == dash["close_batch_count"]
+
+    # current_only 批次 / 长短款都不含 superseded
+    assert [b["business_day"] for b in _batches(client, current_only=True)] == [SEED_DAY]
+    row = next(b for b in _batches(client) if b["batch_no"] == "CB-8001")
+    assert row["status"] == "superseded" and row["is_current"] is False
+
+
+def test_reseal_receipt_variance_and_overview_point_at_same_new_batch(client):
+    """重封回执、长短款现行、总览现行、独立现行端点必须同批（互证不撕裂）。"""
+    assert _set_policy(client, "supersede").status_code == 200
+    first = _seal(client, SEED_TOTAL).json()
+    second = _seal(client, SEED_TOTAL - 7.5).json()
+    assert second["current_batch_id"] == second["batch_id"] != first["batch_id"]
+
+    # 长短款现行挂新批，金额是新差额
+    cur = _variances(client, current_only=True)
+    assert [v["batch_id"] for v in cur] == [second["batch_id"]]
+    assert cur[0]["variance"] == second["variance"] == -7.5
+    # 旧批差额行只是历史
+    old = next(v for v in _variances(client) if v["batch_id"] == first["batch_id"])
+    assert old["is_current"] is False
+
+    # 总览现行与回执同批同数
+    dash = client.get("/api/dashboard").json()
+    assert dash["current_batch_id"] == second["batch_id"]
+    assert dash["current_variance"] == second["variance"]
+    assert dash["open_variance_count"] == 1
+
+    # 独立现行端点同批
+    assert client.get("/api/close/current").json()["id"] == second["batch_id"]
+    assert [b["id"] for b in client.get("/api/close/batches/current").json()] == [
+        second["batch_id"]
+    ]
+    assert [v["batch_id"] for v in client.get("/api/close/variances/current").json()] == [
+        second["batch_id"]
+    ]
